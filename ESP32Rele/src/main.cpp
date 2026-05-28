@@ -1,55 +1,45 @@
-/**
- * ESP32 RELÉ — Módulo 2.3: Filtro de Desescarche
- *
- * Función: Suscrito al topic MQTT del compresor. Cuando Vert.x
- * detecta una alarma de desescarche publica {"command":"ON"} y
- * este ESP32 activa el relé. Al recibir {"command":"OFF"} lo apaga.
- *
- * Hardware:
- *   Relé VCC (DC+) → VIN/5V (o 3.3V según módulo)
- *   Relé GND (DC-) → GND
- *   Relé IN  (SIG) → GPIO 5
- */
+/*
+Está suscrito al topic MQTT del compresor. Cuando Vert.x
+detecta una alarma de desescarche publica {"command":"ON"} y
+este ESP32 activa el relé. Al recibir {"command":"OFF"} lo apaga.
+*/
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// ── Configuración ─────────────────────────────────────────
+// aquí tenemos que ponerle los datos del hotspot del teléfono
 const char* WIFI_SSID     = "junimo";
 const char* WIFI_PASSWORD = "holaholakk";
-const char* MQTT_BROKER   = "10.238.31.189";   // IP del PC con Mosquitto
+const char* MQTT_BROKER   = "10.238.31.189";   // IP del PC
 const int   MQTT_PORT     = 1883;
 
-// Identificadores (deben coincidir con los que usa Vert.x)
+// identificadores del parque y del sensor
 const char* PARK_ID     = "P1";
 const char* ACTUATOR_ID = "A1";
-// Topic resultante: park/P1/food/compressor/A1/command
+// guardamos aquí topic resultante: park/P1/food/compressor/A1/command
 char MQTT_TOPIC_CMD[64];
 
-// ── Hardware ──────────────────────────────────────────────
+// definición de pines
 #define RELAY_PIN 5
-// Lógica del módulo relé: HIGH = bobina energizada (compresor ON)
-// Si tu módulo es de lógica invertida (active-LOW) cambia los valores
+// si es HIGH encendemos el compresor
 #define RELAY_ON  HIGH
 #define RELAY_OFF LOW
 
-// ── Clientes de red ───────────────────────────────────────
 WiFiClient   espClient;
 PubSubClient mqttClient(espClient);
 
-// ── Prototipos ────────────────────────────────────────────
 void connectWiFi();
 void connectMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
-// ─────────────────────────────────────────────────────────
+
 void setup() {
     Serial.begin(115200);
 
     pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, RELAY_OFF);  // Seguro por defecto: compresor apagado
+    digitalWrite(RELAY_PIN, RELAY_OFF);  // por defecto al principio tenemos el compresor apagado
     Serial.println("\n⚡ ESP32 Relé iniciando — compresor por defecto: OFF");
 
     snprintf(MQTT_TOPIC_CMD, sizeof(MQTT_TOPIC_CMD),
@@ -62,23 +52,22 @@ void setup() {
     mqttClient.setCallback(mqttCallback);
 }
 
-// ─────────────────────────────────────────────────────────
+
 void loop() {
     if (WiFi.status() != WL_CONNECTED) connectWiFi();
     if (!mqttClient.connected())        connectMQTT();
     mqttClient.loop();  // Mantiene conexión y procesa mensajes entrantes
-    // Sin delay(): el ESP32 nunca está bloqueado, siempre listo para recibir
+    // cuidado, aquí sin delay()
 }
 
-// ─────────────────────────────────────────────────────────
-/**
- * Callback invocado por PubSubClient al recibir un mensaje MQTT.
- * Payload esperado: {"command":"ON"} o {"command":"OFF"}
- */
+/*
+invocamos la rutina de interrup por PubSubClient al recibir un mensaje MQTT.
+Payload esperado: {"command":"ON"} o {"command":"OFF"}
+*/
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("\n📩 Comando MQTT en [%s]\n", topic);
 
-    // Deserializar el payload (array de bytes → JsonDocument)
+    // deserializamos el JSON, lo tenemos en un array de bytes
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, payload, length);
 
@@ -106,7 +95,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
 }
 
-// ─────────────────────────────────────────────────────────
+
 void connectWiFi() {
     Serial.print("📶 Conectando a WiFi...");
     WiFi.mode(WIFI_STA);

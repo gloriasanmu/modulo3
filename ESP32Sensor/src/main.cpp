@@ -1,14 +1,7 @@
-/**
- * ESP32 SENSOR — Módulo 2.3: Filtro de Desescarche
- *
- * Función: Lee la temperatura del DHT11 y la publica cada 10 s
- * mediante MQTT al topic park/P1/food/freezer/S1/temp.
- *
- * Hardware:
- *   DHT11 VCC  → 3.3V
- *   DHT11 GND  → GND
- *   DHT11 DATA → GPIO 4
- */
+/*
+Esta función lee la temperatura del DHT11 y la publica cada 10 s
+mediante MQTT al topic park/P1/food/freezer/S1/temp.
+*/
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -16,42 +9,40 @@
 #include <ArduinoJson.h>
 #include "DHT.h"
 
-// aquí le metemos los datos del hotspot
+// aquí tenemos que ponerle los datos del hotspot del teléfono
 const char* WIFI_SSID     = "junimo";
 const char* WIFI_PASSWORD = "holaholakk";
-const char* MQTT_BROKER   = "10.238.31.189";   // IP del PC con Mosquitto
+const char* MQTT_BROKER   = "10.238.31.189";   // IP del PC
 const int   MQTT_PORT     = 1883;
 
-// Identificadores de parque / sensor (deben coincidir con Vert.x)
+// identificadores del parque y del sensor
 const char* PARK_ID    = "P1";
 const char* SENSOR_ID  = "S1";
-// Topic resultante: park/P1/food/freezer/S1/temp
+// guardamos aquí topic resultante: park/P1/food/freezer/S1/temp
 char MQTT_TOPIC[64];
 
-// Intervalo de publicación no bloqueante (10 000 ms)
+// se publica cada 10 segundos
 const unsigned long PUBLISH_INTERVAL = 10000;
 unsigned long lastPublishTime = 0;
 
-// ── Hardware ──────────────────────────────────────────────
+// definimos los pines del ESP32 
 #define DHTPIN  4
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 
-// ── Clientes de red ───────────────────────────────────────
 WiFiClient   espClient;
 PubSubClient mqttClient(espClient);
 
-// ── Prototipos ────────────────────────────────────────────
 void connectWiFi();
 void connectMQTT();
 void publishTemperature(float temp);
 
-// ─────────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
+    // inicializamos puerto sserie y sensor dht11
+    Serial.begin(115200); 
     dht.begin();
 
-    // Construir el topic dinámicamente
+    // para construir topic dinámicamente
     snprintf(MQTT_TOPIC, sizeof(MQTT_TOPIC),
              "park/%s/food/freezer/%s/temp", PARK_ID, SENSOR_ID);
 
@@ -63,14 +54,12 @@ void setup() {
     // Este ESP32 solo publica; no necesita callback de suscripción
 }
 
-// ─────────────────────────────────────────────────────────
 void loop() {
-    // Mantener conexiones activas
     if (WiFi.status() != WL_CONNECTED) connectWiFi();
     if (!mqttClient.connected())        connectMQTT();
-    mqttClient.loop();  // Mantiene vivo el keep-alive MQTT
+    mqttClient.loop();  // keep-alive MQTT
 
-    // Temporización no bloqueante
+    // millis() sirve como funicón de temporizacion no bloqueante 
     unsigned long currentMillis = millis();
     if (currentMillis - lastPublishTime >= PUBLISH_INTERVAL) {
         lastPublishTime = currentMillis;
@@ -88,13 +77,13 @@ void loop() {
     }
 }
 
-// ─────────────────────────────────────────────────────────
+
 void publishTemperature(float temp) {
-    // Construir payload JSON
+    // para construir el JSON
     StaticJsonDocument<200> doc;
     doc["sensorId"]  = SENSOR_ID;
     doc["parkId"]    = PARK_ID;
-    doc["value"]     = temp;          // °C
+    doc["value"]     = temp; // en °C
     doc["timestamp"] = millis();
 
     String payload;
@@ -109,7 +98,7 @@ void publishTemperature(float temp) {
     }
 }
 
-// ─────────────────────────────────────────────────────────
+
 void connectWiFi() {
     Serial.print("📶 Conectando a WiFi...");
     WiFi.mode(WIFI_STA);

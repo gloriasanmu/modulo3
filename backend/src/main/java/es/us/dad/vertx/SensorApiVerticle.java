@@ -133,7 +133,9 @@ public class SensorApiVerticle extends AbstractVerticle {
 
 package es.us.dad.vertx;
 
+import io.netty.handler.codec.mqtt.MqttQoS;
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonArray;
@@ -141,11 +143,13 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.handler.BodyHandler;
 import io.vertx.mqtt.MqttClient;
-import io.netty.handler.codec.mqtt.MqttQoS;
+import io.vertx.mysqlclient.MySQLBuilder;
+import io.vertx.mysqlclient.MySQLConnectOptions;
+import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.PoolOptions;
+import io.vertx.sqlclient.Tuple;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -155,7 +159,7 @@ import java.util.Map;
  *  1. Suscribirse al topic MQTT de temperatura del congelador.
  *  2. Detectar si la temperatura supera el umbral crítico (-10°C)
  *     durante más de 20 minutos → clasificarlo como fallo mecánico.
- *  3. En caso de alarma: registrar el evento, publicar comando ON
+ *  3. En caso de alarma: registrar en BD, publicar comando ON
  *     al compresor y OFF 30 s después.
  *  4. Exponer endpoints REST:
  *       GET    /api/v1/parks/:parkId/food/freezer/:sensorId/defrost_logs
@@ -163,34 +167,32 @@ import java.util.Map;
  */
 public class SensorApiVerticle extends AbstractVerticle {
 
-    // ── Constantes de dominio ───────────────────────────────────────
-    private static final double DEFROST_THRESHOLD_CELSIUS = -10.0;   // °C umbral crítico
-    private static final long   DEFROST_WINDOW_MS         = 20 * 60 * 1000L; // 20 minutos
-    private static final long   COMPRESSOR_OFF_DELAY_MS   = 30_000L; // 30 s después de ON
+    private static final double DEFROST_THRESHOLD_CELSIUS = -10.0;
+    private static final long   DEFROST_WINDOW_MS         = 1 * 10 * 1000L; // 20 minutos (para probar le pusimos 10 segundos)
+    private static final long   COMPRESSOR_OFF_DELAY_MS   = 30_000L;
 
-    // ── Estado en memoria ───────────────────────────────────────────
-    /**
-     * Para cada sensorId guarda el instante (ms) en que la temperatura
-     * empezó a superar el umbral. null = sensor por debajo del umbral.
-     */
-    private final Map<String, Long>       thresholdBreachStart = new HashMap<>();
-    private final Map<String, Boolean>    alarmActive          = new HashMap<>();
+    // configurar la base de datos
+    private static final String DB_HOST     = "127.0.0.1";
+    private static final int    DB_PORT     = 3306;
+    private static final String DB_NAME     = "iot_project";
+    // le ponemos aquí nuestro usuario y contraseña de la conexión de mariaDB
+    private static final String DB_USER     = "root";
+    private static final String DB_PASSWORD = "iissi$root";
 
-    /** Registro histórico de eventos de desescarche */
-    private final List<JsonObject>        defrostLogs          = new ArrayList<>();
+    private final Map<String, Long>    thresholdBreachStart = new HashMap<>();
+    private final Map<String, Boolean> alarmActive          = new HashMap<>();
 
-    /** Alarmas activas (se eliminan con DELETE) */
-    private final List<JsonObject>        activeAlarms         = new ArrayList<>();
-
+    // clientes de mqtt y de la base de datos
     private MqttClient mqttClient;
+    private Pool dbClient;
 
-    // ── Ciclo de vida del Verticle ─────────────────────────────────
     @Override
     public void start(Promise<Void> startPromise) {
         setupMqttClient()
+                .compose(v -> setupDatabase())
                 .compose(v -> setupHttpServer())
                 .onSuccess(server -> {
-                    System.out.println("✅ Servidor Híbrido desplegado: HTTP(8080) + MQTT");
+                    System.out.println("✅ Servidor Híbrido desplegado: HTTP(8080) + MQTT + BD");
                     startPromise.complete();
                 })
                 .onFailure(err -> {
@@ -199,8 +201,38 @@ public class SensorApiVerticle extends AbstractVerticle {
                 });
     }
 
-    // ── MQTT ───────────────────────────────────────────────────────
-    private io.vertx.core.Future<Void> setupMqttClient() {
+    // le hacemso el setup a la base de datos
+    private Future<Void> setupDatabase() {
+        Promise<Void> promise = Promise.promise();
+
+        MySQLConnectOptions connectOptions = new MySQLConnectOptions()
+                .setPort(DB_PORT)
+                .setHost(DB_HOST)
+                .setDatabase(DB_NAME)
+                .setUser(DB_USER)
+                .setPassword(DB_PASSWORD);
+
+        PoolOptions poolOptions = new PoolOptions().setMaxSize(5);
+
+        try {
+            dbClient = MySQLBuilder.pool()
+                    .with(poolOptions)
+                    .connectingTo(connectOptions)
+                    .using(vertx)
+                    .build();
+
+            System.out.println("✅ Pool de conexiones MySQL creado.");
+            promise.complete();
+        } catch (Exception e) {
+            System.err.println("❌ Fallo creando pool MySQL: " + e.getMessage());
+            promise.fail(e);
+        }
+
+        return promise.future();
+    }
+
+    // ahora el setup al mqtt
+    private Future<Void> setupMqttClient() {
         Promise<Void> promise = Promise.promise();
         mqttClient = MqttClient.create(vertx);
 
@@ -211,10 +243,8 @@ public class SensorApiVerticle extends AbstractVerticle {
             handleTemperatureMessage(topic, payload);
         });
 
-        mqttClient.connect(1883, "localhost")
+        mqttClient.connect(1883, "10.238.31.189")
                 .onSuccess(conn -> {
-                    // Suscripción genérica a TODOS los sensores de congelador de TODOS los parques
-                    // Wildcard MQTT: park/+/food/freezer/+/temp
                     mqttClient.subscribe("park/+/food/freezer/+/temp", MqttQoS.AT_LEAST_ONCE.value())
                             .onSuccess(ack -> System.out.println("📥 Suscrito a: park/+/food/freezer/+/temp"))
                             .onFailure(err -> System.err.println("❌ Error suscripción: " + err.getMessage()));
@@ -225,13 +255,7 @@ public class SensorApiVerticle extends AbstractVerticle {
         return promise.future();
     }
 
-    /**
-     * Núcleo de la lógica de desescarche.
-     * Invocado cada vez que llega un dato de temperatura por MQTT.
-     *
-     * Topic formato: park/{parkId}/food/freezer/{sensorId}/temp
-     * Payload JSON:  {"sensorId":"S1","parkId":"P1","value":-5.0,"timestamp":12345}
-     */
+
     private void handleTemperatureMessage(String topic, String rawPayload) {
         JsonObject data;
         try {
@@ -241,11 +265,11 @@ public class SensorApiVerticle extends AbstractVerticle {
             return;
         }
 
-        // Extraer identificadores del topic  →  park/P1/food/freezer/S1/temp
+        // Extraer parkId y sensorId del topic: park/P1/food/freezer/S1/temp
         String[] parts = topic.split("/");
         if (parts.length < 6) return;
-        String parkId   = parts[1];  // P1
-        String sensorId = parts[4];  // S1
+        String parkId   = parts[1];
+        String sensorId = parts[4];
         String stateKey = parkId + "/" + sensorId;
 
         double temp      = data.getDouble("value", 0.0);
@@ -254,15 +278,13 @@ public class SensorApiVerticle extends AbstractVerticle {
         System.out.printf("   🌡️  [%s] Temperatura: %.2f°C%n", stateKey, temp);
 
         if (temp > DEFROST_THRESHOLD_CELSIUS) {
-            // ── La temperatura supera el umbral (-10°C) ──────────────
             if (!thresholdBreachStart.containsKey(stateKey)) {
-                // Primera vez que lo supera: arranca el cronómetro
+                // Primera vez que supera el umbral
                 thresholdBreachStart.put(stateKey, nowMillis);
                 System.out.printf("   ⏱️  [%s] Umbral superado — iniciando ventana de %d min%n",
                         stateKey, DEFROST_WINDOW_MS / 60000);
             } else {
-                // Ya estaba en umbral: comprobar si llevamos más de 20 min
-                long elapsed = nowMillis - thresholdBreachStart.get(stateKey);
+                long    elapsed        = nowMillis - thresholdBreachStart.get(stateKey);
                 boolean alreadyAlarmed = alarmActive.getOrDefault(stateKey, false);
 
                 if (elapsed >= DEFROST_WINDOW_MS && !alreadyAlarmed) {
@@ -271,35 +293,19 @@ public class SensorApiVerticle extends AbstractVerticle {
                             stateKey, temp, elapsed / 60000);
                     alarmActive.put(stateKey, true);
 
-                    // Registrar en el log
-                    JsonObject logEntry = new JsonObject()
-                            .put("parkId",    parkId)
-                            .put("sensorId",  sensorId)
-                            .put("startTime", thresholdBreachStart.get(stateKey))
-                            .put("alarmTime", nowMillis)
-                            .put("elapsedMs", elapsed)
-                            .put("tempAtAlarm", temp)
-                            .put("reason",   "Temperatura > " + DEFROST_THRESHOLD_CELSIUS
-                                    + "°C durante más de " + (DEFROST_WINDOW_MS / 60000) + " minutos");
-                    defrostLogs.add(logEntry);
+                    String reason = "Temperatura > " + DEFROST_THRESHOLD_CELSIUS
+                            + "°C durante más de " + (DEFROST_WINDOW_MS / 60000) + " minutos";
 
-                    // Registrar alarma activa
-                    JsonObject alarm = new JsonObject()
-                            .put("parkId",   parkId)
-                            .put("sensorId", sensorId)
-                            .put("timestamp", nowMillis)
-                            .put("type",     "DEFROST_FAILURE");
-                    activeAlarms.add(alarm);
+                    // Guardar en BD y activar compresor
+                    saveDefrostLog(parkId, sensorId, reason, nowMillis, temp);
 
-                    // Activar compresor
-                    activateCompressor(parkId, sensorId, nowMillis);
                 } else if (!alreadyAlarmed) {
                     System.out.printf("   ⏳ [%s] Transcurridos %d min / %d min%n",
                             stateKey, elapsed / 60000, DEFROST_WINDOW_MS / 60000);
                 }
             }
         } else {
-            // ── La temperatura volvió a bajar del umbral ─────────────
+            // Temperatura normalizada
             if (thresholdBreachStart.containsKey(stateKey)) {
                 System.out.printf("   ✅ [%s] Temperatura normalizada (%.2f°C) — reseteando cronómetro%n",
                         stateKey, temp);
@@ -309,12 +315,33 @@ public class SensorApiVerticle extends AbstractVerticle {
         }
     }
 
-    /**
-     * Publica el comando ON al compresor y, tras COMPRESSOR_OFF_DELAY_MS, el comando OFF.
-     * Usa los timers no bloqueantes del EventLoop de Vert.x.
-     */
-    private void activateCompressor(String parkId, String actuatorId, long alarmTime) {
-        // Topic: park/P1/food/compressor/A1/command
+    // para guardar en la base de datos y activar el compresor
+    private void saveDefrostLog(String parkId, String sensorId,
+                                String reason, long nowMillis, double temp) {
+        // insertamos en defrost_logs
+        dbClient.preparedQuery("INSERT INTO defrost_logs (parkId, sensorId) VALUES (?, ?)")
+                .execute(Tuple.of(parkId, sensorId))
+                .onSuccess(rows -> {
+                    System.out.println("💾 Fallo guardado en defrost_logs.");
+
+                    // insertamos en alarms
+                    dbClient.preparedQuery(
+                                    "INSERT INTO alarms (parkId, sensorId, reason) VALUES (?, ?, ?)")
+                            .execute(Tuple.of(parkId, sensorId, reason))
+                            .onSuccess(alarmRows -> {
+                                System.out.println("🚨 Alarma registrada en BD.");
+                                // activamos el compresor por mqtt
+                                activateCompressor(parkId, sensorId);
+                            })
+                            .onFailure(err ->
+                                    System.err.println("❌ Error insertando alarma: " + err.getMessage()));
+                })
+                .onFailure(err ->
+                        System.err.println("❌ Error insertando defrost_log: " + err.getMessage()));
+    }
+
+
+    private void activateCompressor(String parkId, String actuatorId) {
         String topic = String.format("park/%s/food/compressor/%s/command", parkId, actuatorId);
 
         if (!mqttClient.isConnected()) {
@@ -322,13 +349,11 @@ public class SensorApiVerticle extends AbstractVerticle {
             return;
         }
 
-        // ON inmediato
         JsonObject cmdON = new JsonObject().put("command", "ON");
         mqttClient.publish(topic, Buffer.buffer(cmdON.encode()),
                 MqttQoS.AT_LEAST_ONCE, false, false);
         System.out.printf("📤 [%s] Compresor ON despachado%n", topic);
 
-        // OFF tras COMPRESSOR_OFF_DELAY_MS
         vertx.setTimer(COMPRESSOR_OFF_DELAY_MS, id -> {
             JsonObject cmdOFF = new JsonObject().put("command", "OFF");
             mqttClient.publish(topic, Buffer.buffer(cmdOFF.encode()),
@@ -338,62 +363,75 @@ public class SensorApiVerticle extends AbstractVerticle {
         });
     }
 
-    // ── HTTP / REST ────────────────────────────────────────────────
-    private io.vertx.core.Future<io.vertx.core.http.HttpServer> setupHttpServer() {
+
+    private Future<io.vertx.core.http.HttpServer> setupHttpServer() {
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
 
-        // ── GET /api/v1/parks/:parkId/food/freezer/:sensorId/defrost_logs ──
+        // GET /api/v1/parks/:parkId/food/freezer/:sensorId/defrost_logs
         router.get("/api/v1/parks/:parkId/food/freezer/:sensorId/defrost_logs")
                 .handler(ctx -> {
                     String parkId   = ctx.pathParam("parkId");
                     String sensorId = ctx.pathParam("sensorId");
 
-                    JsonArray result = new JsonArray();
-                    for (JsonObject log : defrostLogs) {
-                        if (parkId.equals(log.getString("parkId"))
-                                && sensorId.equals(log.getString("sensorId"))) {
-                            result.add(log);
-                        }
-                    }
-
-                    System.out.printf("📋 GET defrost_logs [%s/%s] → %d registros%n",
-                            parkId, sensorId, result.size());
-
-                    ctx.response()
-                            .setStatusCode(200)
-                            .putHeader("content-type", "application/json")
-                            .end(result.encodePrettily());
+                    dbClient.preparedQuery(
+                                    "SELECT * FROM defrost_logs WHERE parkId = ? AND sensorId = ? ORDER BY startTime DESC")
+                            .execute(Tuple.of(parkId, sensorId))
+                            .onSuccess(rows -> {
+                                JsonArray result = new JsonArray();
+                                rows.forEach(row -> result.add(new JsonObject()
+                                        .put("id",        row.getInteger("id"))
+                                        .put("parkId",    row.getString("parkId"))
+                                        .put("sensorId",  row.getString("sensorId"))
+                                        .put("startTime", row.getValue("startTime").toString())
+                                ));
+                                System.out.printf("📋 GET defrost_logs [%s/%s] → %d registros%n",
+                                        parkId, sensorId, result.size());
+                                ctx.response().setStatusCode(200)
+                                        .putHeader("content-type", "application/json")
+                                        .end(result.encodePrettily());
+                            })
+                            .onFailure(err -> {
+                                System.err.println("❌ Error consultando defrost_logs: " + err.getMessage());
+                                ctx.response().setStatusCode(500)
+                                        .putHeader("content-type", "application/json")
+                                        .end(new JsonObject().put("error", "Error interno").encode());
+                            });
                 });
 
-        // ── DELETE /api/v1/parks/:parkId/food/alarms ───────────────
+        // DELETE /api/v1/parks/:parkId/food/alarms
         router.delete("/api/v1/parks/:parkId/food/alarms")
                 .handler(ctx -> {
                     String parkId = ctx.pathParam("parkId");
 
-                    int before = activeAlarms.size();
-                    activeAlarms.removeIf(a -> parkId.equals(a.getString("parkId")));
-                    // Resetear el flag de alarma activa para ese parque
-                    alarmActive.entrySet().removeIf(e -> e.getKey().startsWith(parkId + "/"));
-                    int removed = before - activeAlarms.size();
-
-                    System.out.printf("🗑️  DELETE alarms [%s] → eliminadas %d alarmas%n",
-                            parkId, removed);
-
-                    ctx.response()
-                            .setStatusCode(200)
-                            .putHeader("content-type", "application/json")
-                            .end(new JsonObject()
-                                    .put("status", "ok")
-                                    .put("deletedAlarms", removed)
-                                    .encode());
+                    dbClient.preparedQuery("DELETE FROM alarms WHERE parkId = ?")
+                            .execute(Tuple.of(parkId))
+                            .onSuccess(rows -> {
+                                // Resetear también el estado en memoria
+                                alarmActive.entrySet().removeIf(e -> e.getKey().startsWith(parkId + "/"));
+                                System.out.printf("🗑️  DELETE alarms [%s] → eliminadas %d alarmas%n",
+                                        parkId, rows.rowCount());
+                                ctx.response().setStatusCode(200)
+                                        .putHeader("content-type", "application/json")
+                                        .end(new JsonObject()
+                                                .put("status", "ok")
+                                                .put("deletedAlarms", rows.rowCount())
+                                                .encode());
+                            })
+                            .onFailure(err -> {
+                                System.err.println("❌ Error eliminando alarmas: " + err.getMessage());
+                                ctx.response().setStatusCode(500)
+                                        .putHeader("content-type", "application/json")
+                                        .end(new JsonObject().put("error", "Error interno").encode());
+                            });
                 });
 
-        // ── GET /api/telemetry (legado, compatibilidad) ────────────
+        // GET /api/telemetry (compatibilidad)
         router.get("/api/telemetry").handler(ctx ->
                 ctx.response()
                         .putHeader("content-type", "application/json")
-                        .end(new JsonObject().put("message", "Usa los endpoints REST del módulo 2.3").encode())
+                        .end(new JsonObject()
+                                .put("message", "Usa los endpoints REST del módulo 2.3").encode())
         );
 
         return vertx.createHttpServer().requestHandler(router).listen(8080);
