@@ -2,6 +2,7 @@
 
 En este trabajo hemos realizado un proyecto de edge computing siguiéndo la temática indicada; el filtro de desescarche para los congeladores de un parque de atracciones. Para esto hemos empleado dos ESP32, uno que actuaba como sensor de temperatura, y otro que actuaba como relé, el cual simulaba un compresor de comida. El comportamiento de ambos ESP32 viene dictado por un vertice en Vert.x, el cual evalúa los datos suministrados según una lógica interna para decidir si las lecturas son correctas, desescarches normales (sin alarma), o desescarches anómalos (con alarma y activación del compresor). La lógica interna sigue el siguiente esquema:
 
+```text
 Llega lectura de temperatura
         │
         ▼
@@ -26,12 +27,12 @@ Llega lectura de temperatura
           SÍ         NO → desescarche normal, limpiar Map
           │
           ▼
-       FALLO CONFIRMADO:
+    ✅ FALLO CONFIRMADO:
     - Insertar en defrost_logs (BD)
     - Insertar en alarms (BD)
     - Publicar MQTT: {"command":"ON"} → topic del compresor
     - Limpiar entry del Map
-
+```
 
 Adjunto aquí una imagen del montaje físico de los ESP32:
 <img width="4080" height="3072" alt="imagen" src="https://github.com/user-attachments/assets/67e53e28-1442-4050-8747-86a8d7d186a9" />
@@ -44,4 +45,6 @@ Y aquí, los mensajes MQTT a través del sistema Pub/Sub que hemos implementado 
 <img width="1268" height="897" alt="imagen" src="https://github.com/user-attachments/assets/75899f98-8536-494b-8766-da297a5bee60" />
 Por último, aquí adjuntamos una imágen del aspecto de la base de datos donde Vert.x publicará las alarmas y los defrost logs:
 <img width="347" height="83" alt="imagen" src="https://github.com/user-attachments/assets/fefbce34-7792-4add-8792-57878fa5ed7c" />
+<img width="418" height="81" alt="imagen" src="https://github.com/user-attachments/assets/6d727fb6-e08c-432b-b9f2-2cb10ab7182b" />
+<img width="719" height="77" alt="imagen" src="https://github.com/user-attachments/assets/dad84336-cd7b-4722-a153-c0df3b18fa6c" />
 
